@@ -1,0 +1,133 @@
+name: Build APK
+
+# Manual build for testing on a phone. Run it from the Actions tab: "Build APK" -> "Run workflow".
+# It builds the "preview" variant: minified with R8 and resource shrinking like a release build,
+# so the APK is far smaller than a debug build. Its package name is xyz.mpv.rex.preview, so it
+# installs next to the original app. Only arm64-v8a is uploaded (almost every modern phone);
+# the universal APK carries four CPU architectures and is several times larger.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle/**"
+      - ".github/workflows/build-apk.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build preview APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # The debug version name carries the commit count, which needs the full history.
+          fetch-depth: 0
+
+      # Finds the Gradle project. If the repository only holds the project as a .zip (GitHub does
+      # not extract uploaded zips), the zip is extracted here, so no manual unzip is needed.
+      - name: Locate project
+        run: |
+          GRADLEW=$(find . -maxdepth 3 -name gradlew -not -path "./_extracted/*" | head -n 1)
+
+          if [ -z "$GRADLEW" ]; then
+            mapfile -d '' ZIPS < <(find . -maxdepth 2 -name "*.zip" -not -path "./_extracted/*" -print0)
+            for ZIP in "${ZIPS[@]}"; do
+              if unzip -l "$ZIP" | grep -q "gradlew$"; then
+                echo "No project files in the repository, extracting: $ZIP"
+                mkdir -p _extracted
+                unzip -q -o "$ZIP" -d _extracted
+                GRADLEW=$(find _extracted -maxdepth 3 -name gradlew | head -n 1)
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$GRADLEW" ]; then
+            echo "::error::No Gradle project found. The repository needs the REX Player project (gradlew, app/, build.gradle.kts) or a .zip that contains it."
+            echo "Repository contents:"
+            ls -la
+            exit 1
+          fi
+
+          DIR=$(dirname "$GRADLEW")
+          echo "Project found in: $DIR"
+
+          if ! find "$DIR" -name SubtitleSearchRepository.kt | grep -q .; then
+            echo "::error::This is the original REX Player without the multi-provider subtitle changes (SubtitleSearchRepository.kt is missing). Use REX-Player-5.5.1-multisub.zip."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+
+      - name: Generate short SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Make gradlew executable
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: chmod +x ./gradlew
+
+      # Android only installs an update over an existing app when both are signed with the same
+      # key. The key is created on the first run and kept in the Actions cache, so later builds
+      # reuse it. It never goes into the repository.
+      - name: Restore signing key
+        id: key-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/rex-signing
+          key: rex-signing-key-v1
+
+      - name: Create signing key (first run only)
+        if: steps.key-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/rex-signing
+          keytool -genkeypair -keystore ~/rex-signing/rex.jks \
+            -storepass rexplayer -keypass rexplayer -alias rex \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=REX Player personal build"
+
+      - name: Build preview APKs (minified)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ./gradlew assemblePreview --stacktrace
+
+      - name: Sign arm64-v8a APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          APK=$(find app/build/outputs/apk/preview -name "app-arm64-v8a-preview*.apk" | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::error::arm64-v8a APK not found"
+            find app/build/outputs -name "*.apk"
+            exit 1
+          fi
+          "$APKSIGNER" sign \
+            --ks ~/rex-signing/rex.jks --ks-key-alias rex \
+            --ks-pass pass:rexplayer --key-pass pass:rexplayer \
+            --out REX-Player-arm64-v8a-preview.apk "$APK"
+          "$APKSIGNER" verify REX-Player-arm64-v8a-preview.apk
+          ls -lh REX-Player-arm64-v8a-preview.apk
+          echo "arm64-v8a APK size: $(du -h REX-Player-arm64-v8a-preview.apk | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload arm64-v8a APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: REX-Player-arm64-v8a-${{ env.SHORT_SHA }}
+          path: ${{ env.PROJECT_DIR }}/REX-Player-arm64-v8a-preview.apk
+          if-no-files-found: error
